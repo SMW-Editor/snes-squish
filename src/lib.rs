@@ -1,6 +1,22 @@
+//! # Optimal SNES compression library
+//!
+//! All functions take the compression algorithm to use as a const-generic
+//! parameter. This should be one of the constants provided below. It's
+//! implemented like this to allow monomorphizing the compression code to a
+//! specific algorithm, which boosts compression performance.
+
+
+/// LC_LZ2 compression, as used in SMW, YI, ALttP, and probably others. Of the
+/// implemented algorithms, this is the fastest to decompress, but has the worst
+/// compression ratio.
 pub const LZ2: u8 = 0;
-pub const LZ3: u8 = 1;
+/// HAL compression, also known as LC_LZ19, used in lots of HAL games, including
+/// all SNES Kirby games. Between LZ2 and LZ3 in terms of both decompression
+/// speed and compression ratio.
 pub const HAL: u8 = 2;
+/// LC_LZ3 compression, used in Pokemon G&S, and commonly in SMW romhacks. Slow
+/// to decompress, but has the best ratio.
+pub const LZ3: u8 = 1;
 
 // "feature macros" for the different compression algorithms
 const fn has_relative_rep(alg: u8) -> bool {
@@ -236,12 +252,22 @@ impl<'a> Packet<'a> {
     }
 }
 
+/// Decompress the given `data`, writing the output into `buf`.
+///
+/// `ALG` should be one of the `LZ2`, `LZ3`, or `HAL` constants. Will panic when
+/// encountering an invalid backreference in the input.
 pub fn decompress<const ALG: u8>(mut data: &[u8], buf: &mut Vec<u8>) {
+    // TODO: better semantics for garbage inputs - currently the panics on bad
+    // backreferences are mostly accidental
     while let Some(c) = Packet::read::<ALG>(&mut data) {
         c.decompress::<ALG>(buf);
     }
 }
 
+/// Decompress the given `data`, writing the output into `buf`. Also prints
+/// every encountered compression command to stdout for debugging.
+///
+/// `ALG` should be one of the `LZ2`, `LZ3`, or `HAL` constants.
 pub fn analyze<const ALG: u8>(mut data: &[u8], buf: &mut Vec<u8>) {
     while let Some(c) = Packet::read::<ALG>(&mut data) {
         println!("{:?}", c);
@@ -378,6 +404,12 @@ fn build_lcp(data: &[u8], suff: &[i32], inv_suff: &[u32]) -> Vec<u32> {
     lcps
 }
 
+/// Compress the given `data`, writing the output into `buf`.
+///
+/// `ALG` should be one of the `LZ2`, `LZ3`, or `HAL` constants. Specifying
+/// non-zero `offset` will only start compressing from index `offset` into data,
+/// but still allows making backreferences to the first `offset` bytes of data,
+/// allowing a basic shared dictionary system to be implemented.
 pub fn compress<'a, const ALG: u8>(data: &'a [u8], offset: usize, buf: &mut Vec<u8>) {
     #[derive(Debug, Copy, Clone)]
     struct DPEntry<'b> {
