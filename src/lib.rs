@@ -39,15 +39,22 @@ const ALG_LZ3: u8 = 1;
 const ALG_HAL: u8 = 2;
 
 // "feature macros" for the different compression algorithms
-const fn has_relative_rep(alg: u8) -> bool {
+
+/// whether the algorithm supports short relative backreference commands
+const fn has_relative_backref(alg: u8) -> bool {
     return alg == ALG_LZ3;
 }
+/// whether the algorithm has zero-fill instead of inc-fill as command 3
 const fn has_zerofill(alg: u8) -> bool {
     return alg == ALG_LZ3;
 }
-const fn has_alt_repeats(alg: u8) -> bool {
+/// whether the algorithm has bit-reverse and reverse-order backreference
+/// commands
+const fn has_alt_backref(alg: u8) -> bool {
     return alg != ALG_LZ2;
 }
+/// whether the word-fill command outputs `len` words (as opposed to `len`
+/// bytes)
 const fn has_double_word(alg: u8) -> bool {
     return alg == ALG_HAL;
 }
@@ -77,23 +84,23 @@ struct Packet<'a> {
     kind: PacketKind<'a>,
 }
 #[derive(Debug, Copy, Clone)]
-enum RepeatKind {
+enum BackrefKind {
     // 0..=127, corresponds to actual offset 1..=128
     Rel(u8),
     // 0..=32767 (or ..=65535 for non-lz3), straight offset
     Abs(u16),
 }
 
-impl RepeatKind {
+impl BackrefKind {
     fn encode<const ALG: u8>(&self, buf: &mut Vec<u8>) {
         match &self {
-            RepeatKind::Rel(x) => {
-                assert!(has_relative_rep(ALG));
+            BackrefKind::Rel(x) => {
+                assert!(has_relative_backref(ALG));
                 assert!(*x < 128);
                 buf.push(x | 0x80);
             }
-            RepeatKind::Abs(x) => {
-                if has_relative_rep(ALG) {
+            BackrefKind::Abs(x) => {
+                if has_relative_backref(ALG) {
                     assert!(*x < 32678);
                 }
                 buf.extend_from_slice(&x.to_be_bytes());
@@ -102,27 +109,27 @@ impl RepeatKind {
     }
     fn offset(&self, pos: usize) -> usize {
         match &self {
-            RepeatKind::Rel(x) => pos - 1 - *x as usize,
-            RepeatKind::Abs(x) => *x as usize,
+            BackrefKind::Rel(x) => pos - 1 - *x as usize,
+            BackrefKind::Abs(x) => *x as usize,
         }
     }
     fn len(&self) -> usize {
         match &self {
-            RepeatKind::Rel(_) => 1,
-            RepeatKind::Abs(_) => 2,
+            BackrefKind::Rel(_) => 1,
+            BackrefKind::Abs(_) => 2,
         }
     }
 }
-fn parse_repeat_kind<const ALG: u8>(data: &mut &[u8]) -> Option<RepeatKind> {
-    if !has_relative_rep(ALG) {
-        return Some(RepeatKind::Abs(next_word_be(data)?));
+fn parse_backref_kind<const ALG: u8>(data: &mut &[u8]) -> Option<BackrefKind> {
+    if !has_relative_backref(ALG) {
+        return Some(BackrefKind::Abs(next_word_be(data)?));
     }
     let b = next_byte(data)?;
     if b & 0x80 == 0x80 {
-        return Some(RepeatKind::Rel(b & 0x7f));
+        return Some(BackrefKind::Rel(b & 0x7f));
     } else {
         let b2 = next_byte(data)?;
-        return Some(RepeatKind::Abs((b as u16) << 8 | (b2 as u16)));
+        return Some(BackrefKind::Abs((b as u16) << 8 | (b2 as u16)));
     }
 }
 
@@ -133,9 +140,9 @@ enum PacketKind<'a> {
     WordFill(&'a [u8]),
     ZeroFill,
     IncreasingFill(u8),
-    Repeat(RepeatKind),
-    BackwardsRepeat(RepeatKind),
-    BitRevRepeat(RepeatKind),
+    Backref(BackrefKind),
+    BackwardsBackref(BackrefKind),
+    BitRevBackref(BackrefKind),
     Eof,
 }
 
@@ -161,10 +168,10 @@ impl<'a> Packet<'a> {
             2 => PacketKind::WordFill(next_chunk(data, 2)?),
             3 if has_zerofill(ALG) => PacketKind::ZeroFill,
             3 => PacketKind::IncreasingFill(next_byte(data)?),
-            4 => PacketKind::Repeat(parse_repeat_kind::<ALG>(data)?),
-            5 if has_alt_repeats(ALG) => PacketKind::BitRevRepeat(parse_repeat_kind::<ALG>(data)?),
-            6 if has_alt_repeats(ALG) => {
-                PacketKind::BackwardsRepeat(parse_repeat_kind::<ALG>(data)?)
+            4 => PacketKind::Backref(parse_backref_kind::<ALG>(data)?),
+            5 if has_alt_backref(ALG) => PacketKind::BitRevBackref(parse_backref_kind::<ALG>(data)?),
+            6 if has_alt_backref(ALG) => {
+                PacketKind::BackwardsBackref(parse_backref_kind::<ALG>(data)?)
             }
             _ => return None,
         };
@@ -194,9 +201,9 @@ impl<'a> Packet<'a> {
             PacketKind::WordFill(b) => buf.extend_from_slice(b),
             PacketKind::ZeroFill if has_zerofill(ALG) => {}
             PacketKind::IncreasingFill(b) if !has_zerofill(ALG) => buf.push(*b),
-            PacketKind::Repeat(b) => b.encode::<ALG>(buf),
-            PacketKind::BitRevRepeat(b) if has_alt_repeats(ALG) => b.encode::<ALG>(buf),
-            PacketKind::BackwardsRepeat(b) if has_alt_repeats(ALG) => b.encode::<ALG>(buf),
+            PacketKind::Backref(b) => b.encode::<ALG>(buf),
+            PacketKind::BitRevBackref(b) if has_alt_backref(ALG) => b.encode::<ALG>(buf),
+            PacketKind::BackwardsBackref(b) if has_alt_backref(ALG) => b.encode::<ALG>(buf),
             _ => panic!("invalid packet for this algorithm"),
         }
     }
@@ -215,19 +222,19 @@ impl<'a> Packet<'a> {
             PacketKind::IncreasingFill(b) => {
                 buf.extend((0..self.len).map(|c| b.wrapping_add(c as u8)))
             }
-            PacketKind::Repeat(b) => {
+            PacketKind::Backref(b) => {
                 let off = b.offset(buf.len());
                 for i in off..off + self.len {
                     buf.push(buf[i]);
                 }
             }
-            PacketKind::BitRevRepeat(b) => {
+            PacketKind::BitRevBackref(b) => {
                 let off = b.offset(buf.len());
                 for i in off..off + self.len {
                     buf.push(buf[i].reverse_bits());
                 }
             }
-            PacketKind::BackwardsRepeat(b) => {
+            PacketKind::BackwardsBackref(b) => {
                 let off = b.offset(buf.len());
                 for i in 0..self.len {
                     buf.push(buf[off - i]);
@@ -250,9 +257,9 @@ impl<'a> Packet<'a> {
             PacketKind::WordFill(_) => 2,
             PacketKind::ZeroFill => 0,
             PacketKind::IncreasingFill(_) => 1,
-            PacketKind::Repeat(x) => x.len(),
-            PacketKind::BackwardsRepeat(x) => x.len(),
-            PacketKind::BitRevRepeat(x) => x.len(),
+            PacketKind::Backref(x) => x.len(),
+            PacketKind::BackwardsBackref(x) => x.len(),
+            PacketKind::BitRevBackref(x) => x.len(),
             PacketKind::Eof => unreachable!(),
         };
         cmd_len + arg_len
@@ -264,9 +271,9 @@ impl<'a> Packet<'a> {
             PacketKind::WordFill(..) => 2,
             PacketKind::ZeroFill => 3,
             PacketKind::IncreasingFill(..) => 3,
-            PacketKind::Repeat(..) => 4,
-            PacketKind::BitRevRepeat(..) => 5,
-            PacketKind::BackwardsRepeat(..) => 6,
+            PacketKind::Backref(..) => 4,
+            PacketKind::BitRevBackref(..) => 5,
+            PacketKind::BackwardsBackref(..) => 6,
             PacketKind::Eof => unreachable!(),
         }
     }
@@ -291,10 +298,14 @@ fn _analyze_internal<const ALG: u8>(mut data: &[u8], buf: &mut Vec<u8>) {
     }
 }
 
-// find an index into data that starts with needle, and starts before needle_pos.
-// suff is suffix array of data. inv_suff is inverse suffix array of data.
-// lcp is longest-common-prefix array of data.
-fn find_repeat<'a, const ALG: u8>(
+/// Look for a back-reference command to cover the range `needle`.
+///
+/// Requires various data structures, namely a suffix array built on the data,
+/// the inverse of the suffix array, and the longest-common-prefix table of the
+/// suffix array.
+///
+/// `needle_pos` must be the index of `needle` in `data`.
+fn find_backref<'a, const ALG: u8>(
     orig_len: usize,
     data: &[u8],
     suff: &[i32],
@@ -304,20 +315,33 @@ fn find_repeat<'a, const ALG: u8>(
     needle: &[u8],
     look_for_short: bool,
 ) -> (Option<(PacketKind<'a>, bool)>, bool) {
+    // This is possibly the most involved part of the compressor. The (inverse)
+    // suffix array is used to locate all occurrences of the needle. We can
+    // efficiently enumerate all matches of the needle using the LCP table,
+    // which gives how many bytes suff[i] and suff[i-1] have in common: once
+    // this is below needle.len(), the respective suffix array entries differ
+    // earlier than the end of the needle, i.e. entry does not begin with needle
+    // anymore. Also, (for non-LZ2 algorithms), the suffix array is built from
+    // not just the data, but also the bit-reverse and reverse-order data, all
+    // concatenated together. This means matches for bit-reverse backref and
+    // reverse-order backref will show up in the same search as regular
+    // backrefs. We can tell which kind of backref to use by where in the
+    // original data the suffix array entry starts at.
+
     let start_pos = inv_suff[needle_pos] as usize;
-    // if we find a valid short encoding, use that. but keep any long encoding
-    // we see as fallback in case there is no short encoding.
+    // since short encodings are better than long ones, if we find a valid short
+    // encoding, use that. but keep any long encoding we see as fallback in case
+    // there is no short encoding.
     let mut out_long: Option<(PacketKind<'a>, bool)> = None;
     // whether there is any matching substring at all - regardless of
-    // constraints on whether we can actually encode a repeat command from it
+    // constraints on whether we can actually encode a backref command from it
     let mut match_exists = false;
     let mut do_i = |i: usize, offset: usize| {
         let ind = suff[i] as usize;
-        // i love how cursed this is
         // Since `data` is actually 3 copies of `orig_data` concatenated with
         // different transforms, figure out where in the original data this
         // match occurred in, and what transform was applied.
-        let (typ, realind) = if has_alt_repeats(ALG) {
+        let (typ, realind) = if has_alt_backref(ALG) {
             //(ind / L, ind % L)
             let mut x = ind;
             let mut y: u32 = 0;
@@ -330,39 +354,39 @@ fn find_repeat<'a, const ALG: u8>(
         // for backwards: realind is the index into the reversed data where the match starts
         // what we need: position of the *last* byte of the match
         // realind=1 means 2nd to last byte is the first matching
-        // so we'd need realrealind = len-2 i *think*??
+        // so we'd need realrealind = len-2
         let realind = if typ == 1 {
             orig_len - 1 - realind
         } else {
             realind
         };
         let mk_packet = |repk| {
-            let is_rel = matches!(repk, RepeatKind::Rel(_));
+            let is_rel = matches!(repk, BackrefKind::Rel(_));
             let pk = match typ {
-                0 => PacketKind::Repeat(repk),
-                1 => PacketKind::BackwardsRepeat(repk),
-                2 => PacketKind::BitRevRepeat(repk),
+                0 => PacketKind::Backref(repk),
+                1 => PacketKind::BackwardsBackref(repk),
+                2 => PacketKind::BitRevBackref(repk),
                 3.. => unreachable!(),
             };
             (pk, is_rel)
         };
         if realind < needle_pos
-                // for backwards repeat, we additionally need to check that we
+                // for backwards refs, we additionally need to check that we
                 // don't go past the start of the input.
                 && (typ != 1 || realind+1>=needle.len())
             // lcp[i] = len of common part of suff[i] and suff[i-1]
             && lcp[i+offset] as usize >= needle.len()
         {
             match_exists = true;
-            if !has_relative_rep(ALG) {
+            if !has_relative_backref(ALG) {
                 if realind <= u16::MAX as usize {
                     // if we don't have short mode, the abs encoding is the best
                     // we can do, so return it immediately
-                    return Some(Some(mk_packet(RepeatKind::Abs(realind as u16))));
+                    return Some(Some(mk_packet(BackrefKind::Abs(realind as u16))));
                 }
             } else {
                 if realind < 32768 {
-                    out_long = Some(mk_packet(RepeatKind::Abs(realind as u16)));
+                    out_long = Some(mk_packet(BackrefKind::Abs(realind as u16)));
                     if !look_for_short {
                         // we know we're not going to find a short repeat, so
                         // this long one will do.
@@ -371,7 +395,7 @@ fn find_repeat<'a, const ALG: u8>(
                 }
                 if needle_pos - realind < 129 {
                     let x = needle_pos - realind - 1;
-                    return Some(Some(mk_packet(RepeatKind::Rel(x as u8))));
+                    return Some(Some(mk_packet(BackrefKind::Rel(x as u8))));
                 }
             }
         }
@@ -450,8 +474,9 @@ fn compress_internal<'a, const ALG: u8>(data: &'a [u8], offset: usize, buf: &mut
             prev: 0,
         });
     }
+    // See find_backref for how all of these data structures are used.
     let mut fuckedupdata = data.to_vec();
-    if has_alt_repeats(ALG) {
+    if has_alt_backref(ALG) {
         fuckedupdata.extend(data.iter().rev());
         fuckedupdata.extend(data.iter().map(|c| c.reverse_bits()));
     }
@@ -463,6 +488,13 @@ fn compress_internal<'a, const ALG: u8>(data: &'a [u8], offset: usize, buf: &mut
     let inv_suff = inv_suffix_array(&suff);
     let lcp = build_lcp(&fuckedupdata, &suff, &inv_suff);
 
+    // general algorithm for the compressor: find the best way to encode the
+    // first `i` bytes of `data`, until we have found the best way to encode the
+    // entirety of `data`. to do this, take the best way to encode the first `j`
+    // bytes (i - 1024 < j < i), and try appending all of the possible commands
+    // of length `i - j` to it. the rest of the code is mostly just tricks to
+    // speed up the 2nd part, by having to consider less commands in each
+    // iteration.
     for i in offset + 1..=data.len() {
         let mut best: Option<DPEntry> = None;
         // if we fail to do a bytefill from one prefix, we have 2 different
@@ -477,14 +509,14 @@ fn compress_internal<'a, const ALG: u8>(data: &'a [u8], offset: usize, buf: &mut
         // but with similar logic you can conclude that one failure implies the
         // rest are going to fail too.
         let mut wordfill_possible = true;
-        let mut repeat_possible = true;
+        let mut backref_possible = true;
         // number of possible command types to check for. used to speed up
         // searching once all (non-direct copy) command types are impossible.
         // this is initialized to 4, even though there are 5 _possible
         // variables, because incfill and zerofill are mutually exclusive.
         let mut n_possible = 4;
         // funky optimization for LZ3: in some bad cases, most of the time is
-        // spent looking for relative repeats when they are not going to ever
+        // spent looking for relative backrefs when they are not going to ever
         // show up. we know that if we didn't find a relative backref for
         // thisdata.len() < 128, we're never going to find a relative one for
         // thisdata.len() > 128 either. (the reasoning goes something like: if
@@ -517,10 +549,10 @@ fn compress_internal<'a, const ALG: u8>(data: &'a [u8], offset: usize, buf: &mut
             let thisdata = &data[j..i];
             let len = thisdata.len();
             // if a bytefill or zerofill is possible for this range, it is
-            // always going to be at least as good as a repeat. so we don't need
-            // to check for repeats at all.
+            // always going to be at least as good as a backref. so we don't need
+            // to check for backrefs at all.
             // (not guaranteed for wordfill though.)
-            let mut check_repeat = repeat_possible;
+            let mut check_backref = backref_possible;
             // direct:
             try_packet(&mut best, len, PacketKind::Direct(thisdata));
             if n_possible == 0 {
@@ -531,7 +563,7 @@ fn compress_internal<'a, const ALG: u8>(data: &'a [u8], offset: usize, buf: &mut
             // assured by the fact that bytefill_possible is true.
             if bytefill_possible && (len < 2 || thisdata[0] == thisdata[1]) {
                 try_packet(&mut best, len, PacketKind::ByteFill(thisdata[0]));
-                check_repeat = false;
+                check_backref = false;
             } else {
                 if bytefill_possible {
                     n_possible -= 1;
@@ -547,14 +579,14 @@ fn compress_internal<'a, const ALG: u8>(data: &'a [u8], offset: usize, buf: &mut
                     if has_double_word(ALG) {
                         if len & 1 == 0 {
                             try_packet(&mut best, len / 2, PacketKind::WordFill(&word));
-                            check_repeat = false;
+                            check_backref = false;
                         }
                     } else {
                         try_packet(&mut best, len, PacketKind::WordFill(&word));
-                        // if we don't have short relative repeats, a wordfill
-                        // is also at least as good as any repeat.
-                        if !has_relative_rep(ALG) {
-                            check_repeat = false;
+                        // if we don't have short relative backrefs, a wordfill
+                        // is also at least as good as any backref.
+                        if !has_relative_backref(ALG) {
+                            check_backref = false;
                         }
                     }
                 } else {
@@ -568,7 +600,7 @@ fn compress_internal<'a, const ALG: u8>(data: &'a [u8], offset: usize, buf: &mut
                 // zerofill:
                 if zerofill_possible && thisdata[0] == 0 {
                     try_packet(&mut best, len, PacketKind::ZeroFill);
-                    check_repeat = false;
+                    check_backref = false;
                 } else {
                     if zerofill_possible {
                         n_possible -= 1;
@@ -581,7 +613,7 @@ fn compress_internal<'a, const ALG: u8>(data: &'a [u8], offset: usize, buf: &mut
                 if incfill_possible && (len < 2 || thisdata[0].wrapping_add(1) == thisdata[1]) {
                     let byte = thisdata[0];
                     try_packet(&mut best, len, PacketKind::IncreasingFill(byte));
-                    check_repeat = false;
+                    check_backref = false;
                 } else {
                     if incfill_possible {
                         n_possible -= 1;
@@ -589,11 +621,11 @@ fn compress_internal<'a, const ALG: u8>(data: &'a [u8], offset: usize, buf: &mut
                     incfill_possible = false;
                 }
             }
-            // repeat:
+            // backref:
             // need to find a previous occurrence of data[j..i] (i.e. starting before j)
-            if check_repeat {
+            if check_backref {
                 let look_for_short = len <= 128 || found_short_backref;
-                let (s, exists) = find_repeat::<ALG>(
+                let (s, exists) = find_backref::<ALG>(
                     data.len(),
                     &fuckedupdata,
                     &suff,
@@ -608,10 +640,10 @@ fn compress_internal<'a, const ALG: u8>(data: &'a [u8], offset: usize, buf: &mut
                     if is_short { found_short_backref = true; }
                 }
                 if !exists {
-                    if repeat_possible {
+                    if backref_possible {
                         n_possible -= 1;
                     }
-                    repeat_possible = false;
+                    backref_possible = false;
                 }
             }
         }
