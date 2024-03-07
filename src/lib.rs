@@ -302,11 +302,12 @@ fn find_repeat<'a, const ALG: u8>(
     lcp: &[u32],
     needle_pos: usize,
     needle: &[u8],
-) -> (Option<PacketKind<'a>>, bool) {
+    look_for_short: bool,
+) -> (Option<(PacketKind<'a>, bool)>, bool) {
     let start_pos = inv_suff[needle_pos] as usize;
     // if we find a valid short encoding, use that. but keep any long encoding
     // we see as fallback in case there is no short encoding.
-    let mut out_long: Option<PacketKind<'a>> = None;
+    let mut out_long: Option<(PacketKind<'a>, bool)> = None;
     // whether there is any matching substring at all - regardless of
     // constraints on whether we can actually encode a repeat command from it
     let mut match_exists = false;
@@ -335,11 +336,15 @@ fn find_repeat<'a, const ALG: u8>(
         } else {
             realind
         };
-        let mk_packet = |repk| match typ {
-            0 => PacketKind::Repeat(repk),
-            1 => PacketKind::BackwardsRepeat(repk),
-            2 => PacketKind::BitRevRepeat(repk),
-            3.. => unreachable!(),
+        let mk_packet = |repk| {
+            let is_rel = matches!(repk, RepeatKind::Rel(_));
+            let pk = match typ {
+                0 => PacketKind::Repeat(repk),
+                1 => PacketKind::BackwardsRepeat(repk),
+                2 => PacketKind::BitRevRepeat(repk),
+                3.. => unreachable!(),
+            };
+            (pk, is_rel)
         };
         if realind < needle_pos
                 // for backwards repeat, we additionally need to check that we
@@ -358,6 +363,11 @@ fn find_repeat<'a, const ALG: u8>(
             } else {
                 if realind < 32768 {
                     out_long = Some(mk_packet(RepeatKind::Abs(realind as u16)));
+                    if !look_for_short {
+                        // we know we're not going to find a short repeat, so
+                        // this long one will do.
+                        return Some(out_long);
+                    }
                 }
                 if needle_pos - realind < 129 {
                     let x = needle_pos - realind - 1;
@@ -473,6 +483,17 @@ fn compress_internal<'a, const ALG: u8>(data: &'a [u8], offset: usize, buf: &mut
         // this is initialized to 4, even though there are 5 _possible
         // variables, because incfill and zerofill are mutually exclusive.
         let mut n_possible = 4;
+        // funky optimization for LZ3: in some bad cases, most of the time is
+        // spent looking for relative repeats when they are not going to ever
+        // show up. we know that if we didn't find a relative backref for
+        // thisdata.len() < 128, we're never going to find a relative one for
+        // thisdata.len() > 128 either. (the reasoning goes something like: if
+        // we find a relative backref for len > 128, it must be overlapping with
+        // the range we're encoding. this means there must have been another
+        // shorter relative backref covering the non-overlapping part, and since
+        // we always check in increasing order of length, we must have found
+        // that earlier)
+        let mut found_short_backref = false;
         // another byte/word/zerofill optimization: don't recheck the entire
         // range every time, only check the first byte. we already keep track of
         // whether the fill was valid in the previous iteration, so the only
@@ -571,6 +592,7 @@ fn compress_internal<'a, const ALG: u8>(data: &'a [u8], offset: usize, buf: &mut
             // repeat:
             // need to find a previous occurrence of data[j..i] (i.e. starting before j)
             if check_repeat {
+                let look_for_short = len <= 128 || found_short_backref;
                 let (s, exists) = find_repeat::<ALG>(
                     data.len(),
                     &fuckedupdata,
@@ -579,9 +601,11 @@ fn compress_internal<'a, const ALG: u8>(data: &'a [u8], offset: usize, buf: &mut
                     &lcp,
                     j,
                     thisdata,
+                    look_for_short,
                 );
-                if let Some(k) = s {
+                if let Some((k, is_short)) = s {
                     try_packet(&mut best, len, k);
+                    if is_short { found_short_backref = true; }
                 }
                 if !exists {
                     if repeat_possible {
