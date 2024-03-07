@@ -1,4 +1,4 @@
-use std::time::Instant;
+use std::time::{Instant, Duration};
 
 use clap::{arg, value_parser, Command};
 use snescompress::{compress, decompress, Algorithm};
@@ -96,11 +96,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 if iter > 0 {
                     println!("--- iteration {} ---", iter + 1);
                 }
+                let mut total_size = 0;
+                let mut total_time = Duration::ZERO;
                 for f in &files {
                     let inp = std::fs::read(f)?;
                     let now = Instant::now();
                     let out = compress(algo, &inp);
                     let duration = now.elapsed();
+                    total_time += duration;
+                    total_size += out.len();
                     let fname = f.file_name().unwrap().to_string_lossy();
                     println!("File {} len = {}, took {:.2?}", fname, out.len(), duration);
                     let decomp = decompress(algo, &out);
@@ -112,6 +116,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             "unexpected compressed file size! expected {}", expected_size);
                     }
                 }
+                println!("Total size: {}, took {:.2?}", total_size, total_time);
             }
         }
         _ => unreachable!(),
