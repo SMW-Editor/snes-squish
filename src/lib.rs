@@ -5,31 +5,51 @@
 //! implemented like this to allow monomorphizing the compression code to a
 //! specific algorithm, which boosts compression performance.
 
+// All the implemented algorithms share the same structure (probably due to all
+// being based on LZ2). Thus they are implemented with the same code, with some
+// helper functions to enable/disable features that are different between the
+// algorithms.
 
-/// LC_LZ2 compression, as used in SMW, YI, ALttP, and probably others. Of the
-/// implemented algorithms, this is the fastest to decompress, but has the worst
-/// compression ratio.
-pub const LZ2: u8 = 0;
-/// HAL compression, also known as LC_LZ19, used in lots of HAL games, including
-/// all SNES Kirby games. Between LZ2 and LZ3 in terms of both decompression
-/// speed and compression ratio.
-pub const HAL: u8 = 2;
-/// LC_LZ3 compression, used in Pokemon G&S, and commonly in SMW romhacks. Slow
-/// to decompress, but has the best ratio.
-pub const LZ3: u8 = 1;
+/// Which compression algorithm to use
+#[non_exhaustive]
+#[derive(Debug, Copy, Clone)]
+pub enum Algorithm {
+    /// LC_LZ2 compression, as used in SMW, YI, ALttP, and probably others. Of
+    /// the implemented algorithms, this is the fastest to decompress, but has
+    /// the worst compression ratio.
+    LZ2,
+    /// HAL compression, also known as LC_LZ19, used in lots of HAL games,
+    /// including all SNES Kirby games. Between LZ2 and LZ3 in terms of both
+    /// decompression speed and compression ratio.
+    HAL,
+    /// LC_LZ3 compression, used in Pokemon G&S, and commonly in SMW romhacks.
+    /// Slow to decompress, but has the best ratio.
+    LZ3,
+}
+
+// re-export the variants for convenience
+pub use Algorithm::*;
+
+// Internal constants that correspond to Algorithm variants.
+// We can't use Algorithm directly because const generics are more limited in
+// stable rust, so we use these values internally and have the public compress
+// function dispatch to the right implementation manually.
+const ALG_LZ2: u8 = 0;
+const ALG_LZ3: u8 = 1;
+const ALG_HAL: u8 = 2;
 
 // "feature macros" for the different compression algorithms
 const fn has_relative_rep(alg: u8) -> bool {
-    return alg == LZ3;
+    return alg == ALG_LZ3;
 }
 const fn has_zerofill(alg: u8) -> bool {
-    return alg == LZ3;
+    return alg == ALG_LZ3;
 }
 const fn has_alt_repeats(alg: u8) -> bool {
-    return alg != LZ2;
+    return alg != ALG_LZ2;
 }
 const fn has_double_word(alg: u8) -> bool {
-    return alg == HAL;
+    return alg == ALG_HAL;
 }
 
 fn next_byte(data: &mut &[u8]) -> Option<u8> {
@@ -254,9 +274,9 @@ impl<'a> Packet<'a> {
 
 /// Decompress the given `data`, writing the output into `buf`.
 ///
-/// `ALG` should be one of the `LZ2`, `LZ3`, or `HAL` constants. Will panic when
+/// `ALG` should be one of the `ALG_*` constants. Will panic when
 /// encountering an invalid backreference in the input.
-pub fn decompress<const ALG: u8>(mut data: &[u8], buf: &mut Vec<u8>) {
+fn decompress_internal<const ALG: u8>(mut data: &[u8], buf: &mut Vec<u8>) {
     // TODO: better semantics for garbage inputs - currently the panics on bad
     // backreferences are mostly accidental
     while let Some(c) = Packet::read::<ALG>(&mut data) {
@@ -264,11 +284,7 @@ pub fn decompress<const ALG: u8>(mut data: &[u8], buf: &mut Vec<u8>) {
     }
 }
 
-/// Decompress the given `data`, writing the output into `buf`. Also prints
-/// every encountered compression command to stdout for debugging.
-///
-/// `ALG` should be one of the `LZ2`, `LZ3`, or `HAL` constants.
-pub fn analyze<const ALG: u8>(mut data: &[u8], buf: &mut Vec<u8>) {
+fn _analyze_internal<const ALG: u8>(mut data: &[u8], buf: &mut Vec<u8>) {
     while let Some(c) = Packet::read::<ALG>(&mut data) {
         println!("{:?}", c);
         c.decompress::<ALG>(buf);
@@ -404,13 +420,9 @@ fn build_lcp(data: &[u8], suff: &[i32], inv_suff: &[u32]) -> Vec<u32> {
     lcps
 }
 
-/// Compress the given `data`, writing the output into `buf`.
-///
-/// `ALG` should be one of the `LZ2`, `LZ3`, or `HAL` constants. Specifying
-/// non-zero `offset` will only start compressing from index `offset` into data,
-/// but still allows making backreferences to the first `offset` bytes of data,
-/// allowing a basic shared dictionary system to be implemented.
-pub fn compress<'a, const ALG: u8>(data: &'a [u8], offset: usize, buf: &mut Vec<u8>) {
+/// Compression implementation. Same arguments as compress_into, but takes the
+/// algorithm as a const-generic parameter to allow monomorphizing.
+fn compress_internal<'a, const ALG: u8>(data: &'a [u8], offset: usize, buf: &mut Vec<u8>) {
     #[derive(Debug, Copy, Clone)]
     struct DPEntry<'b> {
         cost: usize,
@@ -597,3 +609,51 @@ pub fn compress<'a, const ALG: u8>(data: &'a [u8], offset: usize, buf: &mut Vec<
     }
     //dbg!(buf.len());
 }
+
+/// Compress the given `data` with `alg`, writing the output into `buf`.
+///
+/// Specifying non-zero `offset` will only start compressing from index `offset`
+/// into data, but still allows making backreferences to the first `offset`
+/// bytes of data, allowing a basic shared dictionary system to be implemented.
+pub fn compress_into(alg: Algorithm, data: &[u8], offset: usize, buf: &mut Vec<u8>) {
+    match alg {
+        LZ2 => compress_internal::<ALG_LZ2>(data, offset, buf),
+        HAL => compress_internal::<ALG_HAL>(data, offset, buf),
+        LZ3 => compress_internal::<ALG_LZ3>(data, offset, buf),
+    }
+}
+
+/// Compress the `data` with `alg` and return the compressed data.
+pub fn compress(alg: Algorithm, data: &[u8]) -> Vec<u8> {
+    let mut out = vec![];
+    compress_into(alg, data, 0, &mut out);
+    out
+}
+
+/// Decompress the given `data` with `alg`, writing the output into `buf`.
+///
+/// If `data` was compressed using a dictionary, this dictionary should be
+/// present at the beginning of `buf`.
+///
+/// If the compressed data contains illegal backreferences, this function
+/// panics.
+pub fn decompress_into(alg: Algorithm, data: &[u8], buf: &mut Vec<u8>) {
+    match alg {
+        LZ2 => decompress_internal::<ALG_LZ2>(data, buf),
+        HAL => decompress_internal::<ALG_HAL>(data, buf),
+        LZ3 => decompress_internal::<ALG_LZ3>(data, buf),
+    }
+}
+
+/// Decompress the given `data` with `alg` and return the decompressed data.
+///
+/// If the compressed data contains illegal backreferences, this function
+/// panics.
+pub fn decompress(alg: Algorithm, data: &[u8]) -> Vec<u8> {
+    let mut out = vec![];
+    decompress_into(alg, data, &mut out);
+    out
+}
+
+// currently not exposing analyze because i don't feel like it's particularly
+// useful...

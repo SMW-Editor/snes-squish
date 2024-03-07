@@ -1,13 +1,7 @@
 use std::time::Instant;
 
 use clap::{arg, value_parser, Command};
-use snescompress::{compress, decompress, HAL, LZ2, LZ3};
-
-enum Algo {
-    LZ2,
-    LZ3,
-    HAL,
-}
+use snescompress::{compress, decompress, Algorithm};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let matches = Command::new("thingy")
@@ -48,31 +42,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .unwrap_or("lz3");
 
     let algo = match algo {
-        "lz2" => Algo::LZ2,
-        "lz3" => Algo::LZ3,
-        "hal" => Algo::HAL,
+        "lz2" => Algorithm::LZ2,
+        "lz3" => Algorithm::LZ3,
+        "hal" => Algorithm::HAL,
         _ => unreachable!(),
-    };
-    // these we can't just pass the LZ number into compress directly, because we
-    // need to make sure the variants are monomorphized properly. but i also
-    // didn't want to do the string-parsing everywhere all the time
-    let compress_one = |inp: &[u8]| -> Vec<u8> {
-        let mut out = vec![];
-        match algo {
-            Algo::LZ2 => compress::<LZ2>(inp, 0, &mut out),
-            Algo::LZ3 => compress::<LZ3>(inp, 0, &mut out),
-            Algo::HAL => compress::<HAL>(inp, 0, &mut out),
-        }
-        out
-    };
-    let decompress_one = |inp: &[u8]| -> Vec<u8> {
-        let mut out = vec![];
-        match algo {
-            Algo::LZ2 => decompress::<LZ2>(inp, &mut out),
-            Algo::LZ3 => decompress::<LZ3>(inp, &mut out),
-            Algo::HAL => decompress::<HAL>(inp, &mut out),
-        }
-        out
     };
 
     match matches.subcommand() {
@@ -83,13 +56,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 for entry in std::fs::read_dir(inp)? {
                     let entry = entry?;
                     let indata = std::fs::read(entry.path())?;
-                    let outdata = decompress_one(&indata);
+                    let outdata = decompress(algo, &indata);
                     let thingy = std::path::Path::new(out).join(entry.file_name());
                     std::fs::write(thingy, outdata)?;
                 }
             } else {
                 let inp_file = std::fs::read(inp)?;
-                let outbuf = decompress_one(&inp_file);
+                let outbuf = decompress(algo, &inp_file);
                 std::fs::write(out, outbuf)?;
             }
         }
@@ -100,13 +73,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 for entry in std::fs::read_dir(inp)? {
                     let entry = entry?;
                     let indata = std::fs::read(entry.path())?;
-                    let outdata = compress_one(&indata);
+                    let outdata = compress(algo, &indata);
                     let thingy = std::path::Path::new(out).join(entry.file_name());
                     std::fs::write(thingy, outdata)?;
                 }
             } else {
                 let inp_file = std::fs::read(inp)?;
-                let outbuf = compress_one(&inp_file);
+                let outbuf = compress(algo, &inp_file);
                 std::fs::write(out, outbuf)?;
             }
         }
@@ -126,11 +99,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 for f in &files {
                     let inp = std::fs::read(f)?;
                     let now = Instant::now();
-                    let out = compress_one(&inp);
+                    let out = compress(algo, &inp);
                     let duration = now.elapsed();
                     let fname = f.file_name().unwrap().to_string_lossy();
                     println!("File {} len = {}, took {:.2?}", fname, out.len(), duration);
-                    let decomp = decompress_one(&out);
+                    let decomp = decompress(algo, &out);
                     assert!(decomp == inp, "Decompression output mismatch!!");
                     if let Some(d) = checkd {
                         let thingy = std::path::Path::new(d).join(f.file_name().unwrap());
