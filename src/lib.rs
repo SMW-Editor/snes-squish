@@ -1,14 +1,25 @@
 //! # Optimal SNES compression library
 //!
-//! All functions take the compression algorithm to use as a const-generic
-//! parameter. This should be one of the constants provided below. It's
-//! implemented like this to allow monomorphizing the compression code to a
-//! specific algorithm, which boosts compression performance.
-
-// All the implemented algorithms share the same structure (probably due to all
-// being based on LZ2). Thus they are implemented with the same code, with some
-// helper functions to enable/disable features that are different between the
-// algorithms.
+//! This library implements some compression formats commonly found in SNES
+//! games. It is optimized towards minimum output size, and achieves guaranteed
+//! optimal output for all inputs. The performance is probably worse than other
+//! compressors, but should still be fast enough for most uses. The absolute
+//! worst-case 32KB input the author is aware of takes 700ms to compress, but
+//! most real-world inputs should take under 100ms. (This worst case only occurs
+//! with LZ3: with HAL or LZ2, the same input takes 270ms).
+//!
+//! See the [`Algorithm`] enum for implemented algorithms. For basic usage, you
+//! can just pass an Algorithm variant along with your data to [`compress`] or
+//! [`decompress`].
+//!
+//! You can also do a kind of "shared-dictionary" compression if you know there
+//! is some data that's likely to be repeated in multiple compressed files. This
+//! is implemented by putting some data (the dictionary) at the beginning of the
+//! output file before decompressing, allowing the compressed data to make
+//! backreferences into the dictionary. To compress files like this, prepend the
+//! dictionary to your input data and use [`compress_into`], setting `offset` to
+//! the size of the dictionary. When decompressing, use [`decompress_into`],
+//! and make sure the output buffer already contains the dictionary.
 
 /// Which compression algorithm to use
 #[non_exhaustive]
@@ -38,7 +49,10 @@ const ALG_LZ2: u8 = 0;
 const ALG_LZ3: u8 = 1;
 const ALG_HAL: u8 = 2;
 
-// "feature macros" for the different compression algorithms
+// All the implemented algorithms share the same structure (probably due to all
+// being based on LZ2). Thus they are implemented with the same code, with some
+// helper functions to enable/disable features that are different between the
+// algorithms.
 
 /// whether the algorithm supports short relative backreference commands
 const fn has_relative_backref(alg: u8) -> bool {

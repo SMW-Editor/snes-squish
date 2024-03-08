@@ -12,8 +12,8 @@ This library implements 3 compression formats used in SNES games:
 
 It is optimized towards minimum output size, and achieves guaranteed optimal
 output for all inputs. The performance is probably worse than other compressors,
-but should still be fast enough for most uses (for example, the largest input in
-SMW, being around 24KB, takes around 90ms to compress with LZ3).
+but should still be fast enough for most uses (for example, the largest graphics
+file in SMW, being around 24KB, takes around 45ms to compress with LZ3).
 
 All 3 have been tested against [Lunar Compress](https://fusoya.eludevisibility.org/lc/).
 The HAL compression has also been tested against [exhal](https://github.com/devinacker/exhal).
