@@ -454,7 +454,8 @@ struct SegTreeEntry {
 struct OpConstantSize;
 impl segment_tree::ops::Operation<SegTreeEntry> for OpConstantSize {
     fn combine(&self, a: &SegTreeEntry, b: &SegTreeEntry) -> SegTreeEntry {
-        *a.min(b)
+        //*a.min(b)
+        if a.cost.cmp(&b.cost).then(b.ind.cmp(&a.ind)).is_lt() { *a } else { *b }
     }
 }
 
@@ -609,9 +610,11 @@ fn compress_internal<'a, const ALG: u8>(data: &'a [u8], offset: usize, buf: &mut
             update(pk, max, &mut best);
         }
         // short backref
-        if let Some((pk, max_len)) = find_backref::<ALG>(data.len(), &fuckedupdata, &suff, &inv_suff, &lcp, i, true) {
-            let max = (max_len as usize).min(1024);
-            update(pk, max, &mut best);
+        if has_relative_backref(ALG) {
+            if let Some((pk, max_len)) = find_backref::<ALG>(data.len(), &fuckedupdata, &suff, &inv_suff, &lcp, i, true) {
+                let max = (max_len as usize).min(1024);
+                update(pk, max, &mut best);
+            }
         }
         if matches!(best.cmd.kind, PacketKind::Eof) {
             panic!();
