@@ -29,10 +29,6 @@ pub enum Algorithm {
     /// the implemented algorithms, this is the fastest to decompress, but has
     /// the worst compression ratio.
     LZ2,
-    /// HAL compression, also known as LC_LZ19, used in lots of HAL games,
-    /// including all SNES Kirby games. Between LZ2 and LZ3 in terms of both
-    /// decompression speed and compression ratio.
-    HAL,
     /// LC_LZ3 compression, used in Pokemon G&S, and commonly in SMW romhacks.
     /// Slow to decompress, but has the best ratio.
     LZ3,
@@ -47,12 +43,9 @@ pub use Algorithm::*;
 // function dispatch to the right implementation manually.
 const ALG_LZ2: u8 = 0;
 const ALG_LZ3: u8 = 1;
-const ALG_HAL: u8 = 2;
 
-// All the implemented algorithms share the same structure (probably due to all
-// being based on LZ2). Thus they are implemented with the same code, with some
-// helper functions to enable/disable features that are different between the
-// algorithms.
+// these functions made more sense when I tried to implement HAL compression
+// too. but keeping them around doesn't really make things any messier.
 
 /// whether the algorithm supports short relative backreference commands
 const fn has_relative_backref(alg: u8) -> bool {
@@ -66,11 +59,6 @@ const fn has_zerofill(alg: u8) -> bool {
 /// commands
 const fn has_alt_backref(alg: u8) -> bool {
     return alg != ALG_LZ2;
-}
-/// whether the word-fill command outputs `len` words (as opposed to `len`
-/// bytes)
-const fn has_double_word(alg: u8) -> bool {
-    return alg == ALG_HAL;
 }
 
 fn next_byte(data: &mut &[u8]) -> Option<u8> {
@@ -225,13 +213,7 @@ impl<'a> Packet<'a> {
         match self.kind {
             PacketKind::Direct(c) => buf.extend_from_slice(c),
             PacketKind::ByteFill(b) => buf.extend((0..self.len).map(|_| b)),
-            PacketKind::WordFill(b) => {
-                if has_double_word(ALG) {
-                    buf.extend((0..).flat_map(|_| b).take(self.len * 2))
-                } else {
-                    buf.extend((0..).flat_map(|_| b).take(self.len))
-                }
-            }
+            PacketKind::WordFill(b) => buf.extend((0..).flat_map(|_| b).take(self.len)),
             PacketKind::ZeroFill => buf.extend((0..self.len).map(|_| 0)),
             PacketKind::IncreasingFill(b) => {
                 buf.extend((0..self.len).map(|c| b.wrapping_add(c as u8)))
@@ -486,6 +468,27 @@ impl segment_tree::ops::Operation<SegTreeEntry> for OpLinearSize {
     }
 }
 
+struct SegTrees<const ALG: u8> {
+    constant: segment_tree::SegmentPoint<SegTreeEntry, OpConstantSize>,
+    linear: segment_tree::SegmentPoint<SegTreeEntry, OpLinearSize>,
+}
+
+impl<const ALG: u8> SegTrees<ALG> {
+    fn new(len: usize) -> Self {
+        let len = (len + 1) as u32;
+        let constant = segment_tree::SegmentPoint::build((0..len).map(|x| SegTreeEntry { cost: 0, ind: x }).collect(), OpConstantSize);
+        let linear = segment_tree::SegmentPoint::build((0..len).map(|x| SegTreeEntry { cost: 0, ind: x }).collect(), OpLinearSize);
+        Self {
+            constant,
+            linear,
+        }
+    }
+    fn update(&mut self, ind: usize, cost: u32) {
+        self.constant.modify(ind, SegTreeEntry { cost, ind: ind as u32 });
+        self.linear.modify(ind, SegTreeEntry { cost, ind: ind as u32 });
+    }
+}
+
 /// Compression implementation. Same arguments as compress_into, but takes the
 /// algorithm as a const-generic parameter to allow monomorphizing.
 fn compress_internal<'a, const ALG: u8>(data: &'a [u8], offset: usize, buf: &mut Vec<u8>) {
@@ -495,21 +498,19 @@ fn compress_internal<'a, const ALG: u8>(data: &'a [u8], offset: usize, buf: &mut
         cmd: Packet<'b>,
         prev: u32,
     }
-    let data_len = data.len() as u32;
+    //let data_len = data.len() as u32;
     // best_for_suffix[i] = best way to encode data[i..]
     let mut best_for_suffix: Vec<DPEntry> = vec![DPEntry { cost: 0, cmd: Packet::eof(), prev: 0 }; data.len() + 1];
     // segment trees for efficiently finding the best spot to continue from.
     // effectively they allow computing "what is the best cost in data[i..j]",
     // which allows choosing the length of the next command so as to minimize
     // total cost.
-    let mut seg_tree_constant = segment_tree::SegmentPoint::build((0..data_len+1).map(|x| SegTreeEntry { cost: 0, ind: x }).collect(), OpConstantSize);
     // this segment tree uses a different comparison operator, because the "raw
     // data" command scales with the length of data to encode, unlike all other
     // commands whose size is constant.
-    let mut seg_tree_linear = segment_tree::SegmentPoint::build((0..data_len+1).map(|x| SegTreeEntry { cost: 0, ind: x }).collect(), OpLinearSize);
+    let mut segtrees = SegTrees::<ALG>::new(data.len());
     // end of the data is free to encode.
-    seg_tree_constant.modify(data.len(), SegTreeEntry { cost: 0, ind: data_len });
-    seg_tree_linear.modify(data.len(), SegTreeEntry { cost: 0, ind: data_len });
+    segtrees.update(data.len(), 0);
     // See find_backref for how all of these data structures are used.
     let mut fuckedupdata = data.to_vec();
     if has_alt_backref(ALG) {
@@ -539,10 +540,10 @@ fn compress_internal<'a, const ALG: u8>(data: &'a [u8], offset: usize, buf: &mut
             // direct copy:
             // needs to be handled separately because it uses a different
             // segment tree than the other commands
-            let mut best_ind = seg_tree_linear.query_noiden(i+1, (i+32).min(data.len())+1);
+            let mut best_ind = segtrees.linear.query_noiden(i+1, (i+32).min(data.len())+1);
             let bound = (i+1024).min(data.len()) + 1;
             if i+33 < bound {
-                let best_ind2 = seg_tree_linear.query_noiden(i+33, bound);
+                let best_ind2 = segtrees.linear.query_noiden(i+33, bound);
                 best_ind = if best_ind2.cost as usize + best_ind2.ind as usize + 1 < best_ind.cost as usize + best_ind.ind as usize {
                     best_ind2
                 } else { best_ind };
@@ -555,14 +556,14 @@ fn compress_internal<'a, const ALG: u8>(data: &'a [u8], offset: usize, buf: &mut
                 best = DPEntry { cost: newcost, cmd, prev: best_ind.ind };
             }
         }
-        let mut update = |kind: PacketKind<'a>, max_len: usize| {
+        let update = |kind: PacketKind<'a>, max_len: usize, best: &mut DPEntry<'a>| {
             if max_len == 0 { return; }
             // first check short commands
             let upper = (i+max_len).min(data.len());
-            let mut best_ind = seg_tree_constant.query_noiden(i+1, upper.min(i+32)+1);
+            let mut best_ind = segtrees.constant.query_noiden(i+1, upper.min(i+32)+1);
             // then long ones
             if i+33 < upper+1 {
-                let best_ind2 = seg_tree_constant.query_noiden(i+33, upper+1);
+                let best_ind2 = segtrees.constant.query_noiden(i+33, upper+1);
                 // long commands are 1 byte longer, so they have to be better by
                 // at least 1 extra byte
                 if best_ind2.cost + 1 < best_ind.cost {
@@ -571,7 +572,7 @@ fn compress_internal<'a, const ALG: u8>(data: &'a [u8], offset: usize, buf: &mut
             }
             let best_cmd = Packet { len: best_ind.ind as usize - i, kind };
             if (best_cmd.clen() + best_ind.cost as usize) < best.cost as usize {
-                best = DPEntry { cost: best_cmd.clen() as u32 + best_ind.cost, cmd: best_cmd, prev: best_ind.ind };
+                *best = DPEntry { cost: best_cmd.clen() as u32 + best_ind.cost, cmd: best_cmd, prev: best_ind.ind };
             }
         };
         if i+1 < data.len() {
@@ -581,9 +582,9 @@ fn compress_internal<'a, const ALG: u8>(data: &'a [u8], offset: usize, buf: &mut
                 bytefill_len = 1;
             }
             if has_zerofill(ALG) && data[i] == 0 {
-                update(PacketKind::ZeroFill, bytefill_len);
+                update(PacketKind::ZeroFill, bytefill_len, &mut best);
             } else {
-                update(PacketKind::ByteFill(data[i]), bytefill_len);
+                update(PacketKind::ByteFill(data[i]), bytefill_len, &mut best);
             }
             if !has_zerofill(ALG) {
                 if data[i].wrapping_add(1) == data[i+1] {
@@ -591,7 +592,7 @@ fn compress_internal<'a, const ALG: u8>(data: &'a [u8], offset: usize, buf: &mut
                 } else {
                     incfill_len = 1;
                 }
-                update(PacketKind::IncreasingFill(data[i]), incfill_len);
+                update(PacketKind::IncreasingFill(data[i]), incfill_len, &mut best);
             }
         }
         if i+2 < data.len() {
@@ -600,25 +601,23 @@ fn compress_internal<'a, const ALG: u8>(data: &'a [u8], offset: usize, buf: &mut
             } else {
                 wordfill_len = 2;
             }
-            if has_double_word(ALG) { todo!("need to add a 3rd segment tree"); }
-            update(PacketKind::WordFill(&data[i..i+2]), wordfill_len);
+            update(PacketKind::WordFill(&data[i..i+2]), wordfill_len, &mut best);
         }
         // long backref
         if let Some((pk, max_len)) = find_backref::<ALG>(data.len(), &fuckedupdata, &suff, &inv_suff, &lcp, i, false) {
             let max = (max_len as usize).min(1024);
-            update(pk, max);
+            update(pk, max, &mut best);
         }
         // short backref
         if let Some((pk, max_len)) = find_backref::<ALG>(data.len(), &fuckedupdata, &suff, &inv_suff, &lcp, i, true) {
             let max = (max_len as usize).min(1024);
-            update(pk, max);
+            update(pk, max, &mut best);
         }
         if matches!(best.cmd.kind, PacketKind::Eof) {
             panic!();
         }
         best_for_suffix[i] = best;
-        seg_tree_constant.modify(i, SegTreeEntry { cost: best.cost, ind: i as u32 });
-        seg_tree_linear.modify(i, SegTreeEntry { cost: best.cost, ind: i as u32 });
+        segtrees.update(i, best.cost);
     }
     //dbg!(best_for_suffix[offset].cost);
     let mut pkts = vec![];
@@ -644,7 +643,6 @@ fn compress_internal<'a, const ALG: u8>(data: &'a [u8], offset: usize, buf: &mut
 pub fn compress_into(alg: Algorithm, data: &[u8], offset: usize, buf: &mut Vec<u8>) {
     match alg {
         LZ2 => compress_internal::<ALG_LZ2>(data, offset, buf),
-        HAL => compress_internal::<ALG_HAL>(data, offset, buf),
         LZ3 => compress_internal::<ALG_LZ3>(data, offset, buf),
     }
 }
@@ -666,7 +664,6 @@ pub fn compress(alg: Algorithm, data: &[u8]) -> Vec<u8> {
 pub fn decompress_into(alg: Algorithm, data: &[u8], buf: &mut Vec<u8>) {
     match alg {
         LZ2 => decompress_internal::<ALG_LZ2>(data, buf),
-        HAL => decompress_internal::<ALG_HAL>(data, buf),
         LZ3 => decompress_internal::<ALG_LZ3>(data, buf),
     }
 }

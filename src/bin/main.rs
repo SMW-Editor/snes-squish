@@ -8,7 +8,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .arg(
             arg!(-a --algorithm <ALG> "Compression algorithm to use")
                 .default_value("lz3")
-                .value_parser(["lz2", "lz3", "hal"]),
+                .value_parser(["lz2", "lz3"]),
         )
         .subcommand(
             Command::new("decompress")
@@ -44,7 +44,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let algo = match algo {
         "lz2" => Algorithm::LZ2,
         "lz3" => Algorithm::LZ3,
-        "hal" => Algorithm::HAL,
         _ => unreachable!(),
     };
 
