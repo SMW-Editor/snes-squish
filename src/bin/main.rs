@@ -1,7 +1,7 @@
 use std::time::{Instant, Duration};
 
 use clap::{arg, value_parser, Command};
-use snescompress::{compress, decompress, Algorithm};
+use snes_squish::{compress, decompress, Algorithm};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let matches = Command::new("thingy")

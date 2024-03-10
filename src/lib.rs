@@ -312,13 +312,8 @@ fn _analyze_internal<const ALG: u8>(mut data: &[u8], buf: &mut Vec<u8>) {
     }
 }
 
-/// Look for a back-reference command to cover the range `needle`.
-///
-/// Requires various data structures, namely a suffix array built on the data,
-/// the inverse of the suffix array, and the longest-common-prefix table of the
-/// suffix array.
-///
-/// `needle_pos` must be the index of `needle` in `data`.
+/// Finds the longest possible backreference command to use at
+/// data[needle_pos..]. Returns (command, max_length) if found.
 fn find_backref<'a, const ALG: u8>(
     orig_len: usize,
     data: &[u8],
@@ -326,9 +321,8 @@ fn find_backref<'a, const ALG: u8>(
     inv_suff: &[u32],
     lcp: &[u32],
     needle_pos: usize,
-    needle: &[u8],
     look_for_short: bool,
-) -> (Option<(PacketKind<'a>, bool)>, bool) {
+) -> Option<(PacketKind<'a>, u32)> {
     // This is possibly the most involved part of the compressor. The (inverse)
     // suffix array is used to locate all occurrences of the needle. We can
     // efficiently enumerate all matches of the needle using the LCP table,
@@ -342,15 +336,13 @@ fn find_backref<'a, const ALG: u8>(
     // backrefs. We can tell which kind of backref to use by where in the
     // original data the suffix array entry starts at.
 
+    // todo: the linear scanning here still makes the worst-case perf kinda
+    // suck... also maybe we shouldn't use this at all for relative backrefs
+
     let start_pos = inv_suff[needle_pos] as usize;
-    // since short encodings are better than long ones, if we find a valid short
-    // encoding, use that. but keep any long encoding we see as fallback in case
-    // there is no short encoding.
-    let mut out_long: Option<(PacketKind<'a>, bool)> = None;
-    // whether there is any matching substring at all - regardless of
-    // constraints on whether we can actually encode a backref command from it
-    let mut match_exists = false;
-    let mut do_i = |i: usize, offset: usize| {
+    // how long a match needs to be in order to ever be worth using
+    let min_match_len = if look_for_short { 2 } else { 3 };
+    let do_i = |i: usize, offset: usize, matchlen: &mut u32| {
         let ind = suff[i] as usize;
         // Since `data` is actually 3 copies of `orig_data` concatenated with
         // different transforms, figure out where in the original data this
@@ -374,59 +366,60 @@ fn find_backref<'a, const ALG: u8>(
         } else {
             realind
         };
-        let mk_packet = |repk| {
-            let is_rel = matches!(repk, BackrefKind::Rel(_));
-            let pk = match typ {
-                0 => PacketKind::Backref(repk),
-                1 => PacketKind::BackwardsBackref(repk),
-                2 => PacketKind::BitRevBackref(repk),
-                3.. => unreachable!(),
-            };
-            (pk, is_rel)
+        let mk_packet = |repk| match typ {
+            0 => PacketKind::Backref(repk),
+            1 => PacketKind::BackwardsBackref(repk),
+            2 => PacketKind::BitRevBackref(repk),
+            3.. => unreachable!(),
         };
-        if realind < needle_pos
-                // for backwards refs, we additionally need to check that we
-                // don't go past the start of the input.
-                && (typ != 1 || realind+1>=needle.len())
-            // lcp[i] = len of common part of suff[i] and suff[i-1]
-            && lcp[i+offset] as usize >= needle.len()
+        *matchlen = (*matchlen).min(lcp[i+offset]);
+        // backwards refs must not actually go past the beginning of data.
+        // but for LCP purposes we still need to keep the lcp-derived length
+        // around
+        let real_matchlen = if typ != 1 { *matchlen } else { (*matchlen).min(realind as u32 + 1) };
+        if realind < needle_pos && real_matchlen >= min_match_len
         {
-            match_exists = true;
             if !has_relative_backref(ALG) {
                 if realind <= u16::MAX as usize {
-                    // if we don't have short mode, the abs encoding is the best
-                    // we can do, so return it immediately
+                    *matchlen = real_matchlen;
                     return Some(Some(mk_packet(BackrefKind::Abs(realind as u16))));
                 }
             } else {
-                if realind < 32768 {
-                    out_long = Some(mk_packet(BackrefKind::Abs(realind as u16)));
-                    if !look_for_short {
-                        // we know we're not going to find a short repeat, so
-                        // this long one will do.
-                        return Some(out_long);
+                if !look_for_short {
+                    if realind < 32768 {
+                        *matchlen = real_matchlen;
+                         return Some(Some(mk_packet(BackrefKind::Abs(realind as u16))));
                     }
-                }
-                if needle_pos - realind < 129 {
-                    let x = needle_pos - realind - 1;
-                    return Some(Some(mk_packet(BackrefKind::Rel(x as u8))));
+                } else {
+                    if needle_pos - realind < 129 {
+                        let x = needle_pos - realind - 1;
+                        *matchlen = real_matchlen;
+                        return Some(Some(mk_packet(BackrefKind::Rel(x as u8))));
+                    }
                 }
             }
         }
-        // once we have a prefix shorter than the needle, the needle doesn't
-        // match anymore.
-        if (lcp[i + offset] as usize) < needle.len() {
+        if *matchlen < min_match_len {
             return Some(None);
         }
         None
     };
-    if let Some(Some(v)) = (start_pos + 1..data.len()).find_map(|i| do_i(i, 0)) {
-        return (Some(v), true);
+    let mut matchlen = u32::MAX;
+    let mut output = None;
+    if let Some(Some(v)) = (start_pos + 1..data.len()).find_map(|i| do_i(i, 0, &mut matchlen)) {
+        output = Some((v, matchlen));
     }
-    if let Some(Some(v)) = (0..start_pos).rev().find_map(|i| do_i(i, 1)) {
-        return (Some(v), true);
+    let mut matchlen2 = u32::MAX;
+    if let Some(Some(v)) = (0..start_pos).rev().find_map(|i| do_i(i, 1, &mut matchlen2)) {
+        if let Some(k) = output {
+            if matchlen2 > k.1 {
+                output = Some((v, matchlen2));
+            }
+        } else {
+            output = Some((v, matchlen2));
+        }
     }
-    (out_long, match_exists)
+    output
 }
 
 // build inverse suffix array given a regular suffix array
@@ -468,32 +461,64 @@ fn build_lcp(data: &[u8], suff: &[i32], inv_suff: &[u32]) -> Vec<u32> {
     lcps
 }
 
+// this derives a lexicographic Ord, which means when taking the minimum, we'll
+// first get the min by cost, and then by ind.
+#[derive(Eq, Ord, PartialEq, PartialOrd, Copy, Clone)]
+struct SegTreeEntry {
+    cost: u32,
+    ind: u32,
+}
+
+struct OpConstantSize;
+impl segment_tree::ops::Operation<SegTreeEntry> for OpConstantSize {
+    fn combine(&self, a: &SegTreeEntry, b: &SegTreeEntry) -> SegTreeEntry {
+        *a.min(b)
+    }
+}
+
+struct OpLinearSize;
+impl segment_tree::ops::Operation<SegTreeEntry> for OpLinearSize {
+    fn combine(&self, a: &SegTreeEntry, b: &SegTreeEntry) -> SegTreeEntry {
+        // if the command is linear-size, larger indices are worse, since they
+        // need a longer command.
+        // so the real cost is cost+ind
+        if (a.cost as u64 + a.ind as u64) > (b.cost as u64 + b.ind as u64) { *b } else { *a }
+    }
+}
+
 /// Compression implementation. Same arguments as compress_into, but takes the
 /// algorithm as a const-generic parameter to allow monomorphizing.
 fn compress_internal<'a, const ALG: u8>(data: &'a [u8], offset: usize, buf: &mut Vec<u8>) {
     #[derive(Debug, Copy, Clone)]
     struct DPEntry<'b> {
-        cost: usize,
+        cost: u32,
         cmd: Packet<'b>,
-        prev: usize,
+        prev: u32,
     }
-    // best_for_prefix[i] is the best way to encode the first i bytes of data
-    let mut best_for_prefix: Vec<DPEntry> = Vec::with_capacity(data.len() + 1);
-    // dummy packet here to avoid special-casing later.
-    // you can encode an empty string at a cost of 0, so makes sense to me.
-    for _ in 0..offset + 1 {
-        best_for_prefix.push(DPEntry {
-            cost: 0,
-            cmd: Packet::eof(),
-            prev: 0,
-        });
-    }
+    let data_len = data.len() as u32;
+    // best_for_suffix[i] = best way to encode data[i..]
+    let mut best_for_suffix: Vec<DPEntry> = vec![DPEntry { cost: 0, cmd: Packet::eof(), prev: 0 }; data.len() + 1];
+    // segment trees for efficiently finding the best spot to continue from.
+    // effectively they allow computing "what is the best cost in data[i..j]",
+    // which allows choosing the length of the next command so as to minimize
+    // total cost.
+    let mut seg_tree_constant = segment_tree::SegmentPoint::build((0..data_len+1).map(|x| SegTreeEntry { cost: 0, ind: x }).collect(), OpConstantSize);
+    // this segment tree uses a different comparison operator, because the "raw
+    // data" command scales with the length of data to encode, unlike all other
+    // commands whose size is constant.
+    let mut seg_tree_linear = segment_tree::SegmentPoint::build((0..data_len+1).map(|x| SegTreeEntry { cost: 0, ind: x }).collect(), OpLinearSize);
+    // end of the data is free to encode.
+    seg_tree_constant.modify(data.len(), SegTreeEntry { cost: 0, ind: data_len });
+    seg_tree_linear.modify(data.len(), SegTreeEntry { cost: 0, ind: data_len });
     // See find_backref for how all of these data structures are used.
     let mut fuckedupdata = data.to_vec();
     if has_alt_backref(ALG) {
         fuckedupdata.extend(data.iter().rev());
         fuckedupdata.extend(data.iter().map(|c| c.reverse_bits()));
     }
+    // suff like suffering amirite
+    // (okay, i personally find the suffix arrays to cause less suffering than
+    // segment trees. but close enough.)
     let suff = {
         let mut tmp = vec![0i32; fuckedupdata.len()];
         divsufsort::sort_in_place(&fuckedupdata, &mut tmp);
@@ -502,178 +527,109 @@ fn compress_internal<'a, const ALG: u8>(data: &'a [u8], offset: usize, buf: &mut
     let inv_suff = inv_suffix_array(&suff);
     let lcp = build_lcp(&fuckedupdata, &suff, &inv_suff);
 
-    // general algorithm for the compressor: find the best way to encode the
-    // first `i` bytes of `data`, until we have found the best way to encode the
-    // entirety of `data`. to do this, take the best way to encode the first `j`
-    // bytes (i - 1024 < j < i), and try appending all of the possible commands
-    // of length `i - j` to it. the rest of the code is mostly just tricks to
-    // speed up the 2nd part, by having to consider less commands in each
-    // iteration.
-    for i in offset + 1..=data.len() {
-        let mut best: Option<DPEntry> = None;
-        // if we fail to do a bytefill from one prefix, we have 2 different
-        // bytes in the prefix, and any longer prefix would have to cover those
-        // bytes too, which means the bytefill is guaranteed to fail. so don't
-        // even bother checking if we already failed once. same logic goes for
-        // incfill.
-        let mut bytefill_possible = true;
-        let mut zerofill_possible = true;
-        let mut incfill_possible = true;
-        // wordfill is trickier due to the possible parity of where to start,
-        // but with similar logic you can conclude that one failure implies the
-        // rest are going to fail too.
-        let mut wordfill_possible = true;
-        let mut backref_possible = true;
-        // number of possible command types to check for. used to speed up
-        // searching once all (non-direct copy) command types are impossible.
-        // this is initialized to 4, even though there are 5 _possible
-        // variables, because incfill and zerofill are mutually exclusive.
-        let mut n_possible = 4;
-        // funky optimization for LZ3: in some bad cases, most of the time is
-        // spent looking for relative backrefs when they are not going to ever
-        // show up. we know that if we didn't find a relative backref for
-        // thisdata.len() < 128, we're never going to find a relative one for
-        // thisdata.len() > 128 either. (the reasoning goes something like: if
-        // we find a relative backref for len > 128, it must be overlapping with
-        // the range we're encoding. this means there must have been another
-        // shorter relative backref covering the non-overlapping part, and since
-        // we always check in increasing order of length, we must have found
-        // that earlier)
-        let mut found_short_backref = false;
-        // another byte/word/zerofill optimization: don't recheck the entire
-        // range every time, only check the first byte. we already keep track of
-        // whether the fill was valid in the previous iteration, so the only
-        // thing we need to check for is whether the newly added byte fits the
-        // previous fill's pattern. this optimization requires that we iterate
-        // in this order though.
-        for j in (i.saturating_sub(1024)..i).rev() {
-            // helper that sets the best packet if it's better than the current one.
-            let try_packet = |best: &mut Option<DPEntry<'a>>, len: usize, kind: PacketKind<'a>| {
-                let cmd = Packet { len, kind };
-                let cost = cmd.clen() + best_for_prefix[j].cost;
-                if let Some(b) = best {
-                    if cost < b.cost {
-                        *best = Some(DPEntry { cost, cmd, prev: j });
-                    }
-                } else {
-                    *best = Some(DPEntry { cost, cmd, prev: j });
-                }
-            };
-            // j<i, so our target range is always at least 1 byte
-            let thisdata = &data[j..i];
-            let len = thisdata.len();
-            // if a bytefill or zerofill is possible for this range, it is
-            // always going to be at least as good as a backref. so we don't need
-            // to check for backrefs at all.
-            // (not guaranteed for wordfill though.)
-            let mut check_backref = backref_possible;
-            // direct:
-            try_packet(&mut best, len, PacketKind::Direct(thisdata));
-            if n_possible == 0 {
-                continue;
+    // current possible lengths of the fill commands.
+    let mut bytefill_len = 1_usize;
+    let mut wordfill_len = 2_usize;
+    let mut incfill_len = 1_usize;
+
+    // TODO document implementation ideas here again
+    for i in (offset..data.len()).rev() {
+        let mut best = DPEntry { cost: u32::MAX, cmd: Packet::eof(), prev: 0 };
+        {
+            // direct copy:
+            // needs to be handled separately because it uses a different
+            // segment tree than the other commands
+            let mut best_ind = seg_tree_linear.query_noiden(i+1, (i+32).min(data.len())+1);
+            let bound = (i+1024).min(data.len()) + 1;
+            if i+33 < bound {
+                let best_ind2 = seg_tree_linear.query_noiden(i+33, bound);
+                best_ind = if best_ind2.cost as usize + best_ind2.ind as usize + 1 < best_ind.cost as usize + best_ind.ind as usize {
+                    best_ind2
+                } else { best_ind };
             }
-            // bytefill:
-            // we only need to check the first byte. the rest are already
-            // assured by the fact that bytefill_possible is true.
-            if bytefill_possible && (len < 2 || thisdata[0] == thisdata[1]) {
-                try_packet(&mut best, len, PacketKind::ByteFill(thisdata[0]));
-                check_backref = false;
-            } else {
-                if bytefill_possible {
-                    n_possible -= 1;
-                }
-                bytefill_possible = false;
-            }
-            // wordfill:
-            if len >= 2 {
-                if wordfill_possible && (len < 3 || thisdata[0] == thisdata[2]) {
-                    let word = &thisdata[..2];
-                    // in HAL, the length on a wordfill is the number of words to write. so we
-                    // cannot encode an odd wordfill like in the other formats.
-                    if has_double_word(ALG) {
-                        if len & 1 == 0 {
-                            try_packet(&mut best, len / 2, PacketKind::WordFill(&word));
-                            check_backref = false;
-                        }
-                    } else {
-                        try_packet(&mut best, len, PacketKind::WordFill(&word));
-                        // if we don't have short relative backrefs, a wordfill
-                        // is also at least as good as any backref.
-                        if !has_relative_backref(ALG) {
-                            check_backref = false;
-                        }
-                    }
-                } else {
-                    if wordfill_possible {
-                        n_possible -= 1;
-                    }
-                    wordfill_possible = false;
-                }
-            }
-            if has_zerofill(ALG) {
-                // zerofill:
-                if zerofill_possible && thisdata[0] == 0 {
-                    try_packet(&mut best, len, PacketKind::ZeroFill);
-                    check_backref = false;
-                } else {
-                    if zerofill_possible {
-                        n_possible -= 1;
-                    }
-                    zerofill_possible = false;
-                }
-            }
-            if !has_zerofill(ALG) {
-                // incfill:
-                if incfill_possible && (len < 2 || thisdata[0].wrapping_add(1) == thisdata[1]) {
-                    let byte = thisdata[0];
-                    try_packet(&mut best, len, PacketKind::IncreasingFill(byte));
-                    check_backref = false;
-                } else {
-                    if incfill_possible {
-                        n_possible -= 1;
-                    }
-                    incfill_possible = false;
-                }
-            }
-            // backref:
-            // need to find a previous occurrence of data[j..i] (i.e. starting before j)
-            if check_backref {
-                let look_for_short = len <= 128 || found_short_backref;
-                let (s, exists) = find_backref::<ALG>(
-                    data.len(),
-                    &fuckedupdata,
-                    &suff,
-                    &inv_suff,
-                    &lcp,
-                    j,
-                    thisdata,
-                    look_for_short,
-                );
-                if let Some((k, is_short)) = s {
-                    try_packet(&mut best, len, k);
-                    if is_short { found_short_backref = true; }
-                }
-                if !exists {
-                    if backref_possible {
-                        n_possible -= 1;
-                    }
-                    backref_possible = false;
-                }
+            let l = best_ind.ind as usize - i;
+            debug_assert!(l > 0);
+            let cmd = Packet { len: l, kind: PacketKind::Direct(&data[i..i+l as usize]) };
+            let newcost = cmd.clen() as u32 + best_ind.cost;
+            if newcost < best.cost {
+                best = DPEntry { cost: newcost, cmd, prev: best_ind.ind };
             }
         }
-        best_for_prefix.push(best.unwrap());
+        let mut update = |kind: PacketKind<'a>, max_len: usize| {
+            if max_len == 0 { return; }
+            // first check short commands
+            let upper = (i+max_len).min(data.len());
+            let mut best_ind = seg_tree_constant.query_noiden(i+1, upper.min(i+32)+1);
+            // then long ones
+            if i+33 < upper+1 {
+                let best_ind2 = seg_tree_constant.query_noiden(i+33, upper+1);
+                // long commands are 1 byte longer, so they have to be better by
+                // at least 1 extra byte
+                if best_ind2.cost + 1 < best_ind.cost {
+                    best_ind = best_ind2;
+                }
+            }
+            let best_cmd = Packet { len: best_ind.ind as usize - i, kind };
+            if (best_cmd.clen() + best_ind.cost as usize) < best.cost as usize {
+                best = DPEntry { cost: best_cmd.clen() as u32 + best_ind.cost, cmd: best_cmd, prev: best_ind.ind };
+            }
+        };
+        if i+1 < data.len() {
+            if data[i] == data[i+1] {
+                bytefill_len = (bytefill_len + 1).min(1024);
+            } else {
+                bytefill_len = 1;
+            }
+            if has_zerofill(ALG) && data[i] == 0 {
+                update(PacketKind::ZeroFill, bytefill_len);
+            } else {
+                update(PacketKind::ByteFill(data[i]), bytefill_len);
+            }
+            if !has_zerofill(ALG) {
+                if data[i].wrapping_add(1) == data[i+1] {
+                    incfill_len = (incfill_len + 1).min(1024);
+                } else {
+                    incfill_len = 1;
+                }
+                update(PacketKind::IncreasingFill(data[i]), incfill_len);
+            }
+        }
+        if i+2 < data.len() {
+            if data[i] == data[i+2] {
+                wordfill_len = (wordfill_len + 1).min(1024);
+            } else {
+                wordfill_len = 2;
+            }
+            if has_double_word(ALG) { todo!("need to add a 3rd segment tree"); }
+            update(PacketKind::WordFill(&data[i..i+2]), wordfill_len);
+        }
+        // long backref
+        if let Some((pk, max_len)) = find_backref::<ALG>(data.len(), &fuckedupdata, &suff, &inv_suff, &lcp, i, false) {
+            let max = (max_len as usize).min(1024);
+            update(pk, max);
+        }
+        // short backref
+        if let Some((pk, max_len)) = find_backref::<ALG>(data.len(), &fuckedupdata, &suff, &inv_suff, &lcp, i, true) {
+            let max = (max_len as usize).min(1024);
+            update(pk, max);
+        }
+        if matches!(best.cmd.kind, PacketKind::Eof) {
+            panic!();
+        }
+        best_for_suffix[i] = best;
+        seg_tree_constant.modify(i, SegTreeEntry { cost: best.cost, ind: i as u32 });
+        seg_tree_linear.modify(i, SegTreeEntry { cost: best.cost, ind: i as u32 });
     }
-    //dbg!(best_for_prefix[data.len()].cost);
+    //dbg!(best_for_suffix[offset].cost);
     let mut pkts = vec![];
-    let mut i = data.len();
-    while i > offset {
-        let pk = best_for_prefix[i].cmd;
+    let mut i = offset;
+    loop {
+        let pk = best_for_suffix[i].cmd;
         pkts.push(pk);
-        i = best_for_prefix[i].prev;
+        if i == data.len() { break; }
+        i = best_for_suffix[i].prev as usize;
     }
-    pkts.reverse();
-    pkts.push(Packet::eof());
-    //dbg!(&pkts);
+    //println!("{:?}", &pkts);
     for x in pkts.iter() {
         x.compress::<ALG>(buf);
     }

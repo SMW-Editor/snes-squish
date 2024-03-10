@@ -1,5 +1,5 @@
 [package]
-name = "snescompress"
+name = "snes-squish"
 version = "0.1.0"
 edition = "2021"
 
@@ -8,6 +8,11 @@ edition = "2021"
 [dependencies]
 clap = "4.5.1"
 divsufsort = "2.0.0"
+segment-tree = "2.0.0"
 
 [profile.release]
 debug = true
+#strip = "symbols"
+#opt-level = "s"
+# fat lto is slower lol
+lto = "thin"
