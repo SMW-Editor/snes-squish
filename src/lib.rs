@@ -32,6 +32,7 @@ pub enum Algorithm {
     /// LC_LZ3 compression, used in Pokemon G&S, and commonly in SMW romhacks.
     /// Slow to decompress, but has the best ratio.
     LZ3,
+    MyThing,
 }
 
 // re-export the variants for convenience
@@ -638,6 +639,180 @@ fn compress_internal<'a, const ALG: u8>(data: &'a [u8], offset: usize, buf: &mut
     //dbg!(buf.len());
 }
 
+#[derive(Debug, Copy, Clone)]
+enum MyPacketKind {
+    Direct { offset: usize },
+    Backref { offset: usize },
+    Wordfill(u8, u8),
+    Eof,
+}
+#[derive(Debug, Copy, Clone)]
+struct MyPacket {
+    kind: MyPacketKind,
+    len: usize,
+}
+impl MyPacket {
+    fn size(&self) -> usize {
+        match self.kind {
+            MyPacketKind::Direct { .. } => 1 + self.len,
+            MyPacketKind::Backref { .. } => 3,
+            MyPacketKind::Wordfill(..) => 3,
+            MyPacketKind::Eof => 1,
+        }
+    }
+    fn encode(&self, orig_data: &[u8], buf: &mut Vec<u8>, literals: &mut Vec<u8>) {
+        match self.kind {
+            MyPacketKind::Direct { offset } => {
+                debug_assert!(self.len < 128);
+                debug_assert!(self.len > 0);
+                buf.push(self.len as u8);
+                literals.extend_from_slice(&orig_data[offset..offset+self.len]);
+            }
+            MyPacketKind::Backref { offset } => {
+                debug_assert!(self.len <= 64);
+                debug_assert!(self.len > 0);
+                buf.push(self.len as u8 - 1 | 0xc0);
+                buf.extend_from_slice(&(offset as u16).to_le_bytes());
+            }
+            MyPacketKind::Wordfill(a, b) => {
+                debug_assert!(self.len < 64);
+                debug_assert!(self.len > 0);
+                buf.push(self.len as u8 | 0x80);
+                buf.push(a);
+                buf.push(b);
+            }
+            MyPacketKind::Eof => buf.push(0x80),
+        }
+    }
+}
+
+fn compress_mything(data: &[u8], buf: &mut Vec<u8>) {
+    #[derive(Debug, Copy, Clone)]
+    struct DPEntry {
+        cost: u32,
+        cmd: MyPacket,
+        prev: u32,
+    }
+    //let data_len = data.len() as u32;
+    // best_for_suffix[i] = best way to encode data[i..]
+    let mut best_for_suffix: Vec<DPEntry> = vec![DPEntry { cost: 0, cmd: MyPacket { len: 0, kind: MyPacketKind::Eof }, prev: 0 }; data.len() + 1];
+    let mut segtrees = SegTrees::<ALG_LZ2>::new(data.len());
+    // end of the data is free to encode.
+    segtrees.update(data.len(), 0);
+    // See find_backref for how all of these data structures are used.
+    let fuckedupdata = data.to_vec();
+    let suff = {
+        let mut tmp = vec![0i32; fuckedupdata.len()];
+        divsufsort::sort_in_place(&fuckedupdata, &mut tmp);
+        tmp
+    };
+    let inv_suff = inv_suffix_array(&suff);
+    let lcp = build_lcp(&fuckedupdata, &suff, &inv_suff);
+
+    // current possible lengths of the fill commands.
+    let mut wordfill_len = 2_usize;
+
+    // TODO document implementation ideas here again
+    for i in (0..data.len()).rev() {
+        let mut best = DPEntry { cost: u32::MAX, cmd: MyPacket { len: 0, kind: MyPacketKind::Eof }, prev: 0 };
+        {
+            // direct copy:
+            // needs to be handled separately because it uses a different
+            // segment tree than the other commands
+            let best_ind = segtrees.linear.query_noiden(i+1, (i+127).min(data.len())+1);
+            let l = best_ind.ind as usize - i;
+            debug_assert!(l > 0);
+            let cmd = MyPacket { len: l, kind: MyPacketKind::Direct { offset: i } };
+            let newcost = cmd.size() as u32 + best_ind.cost;
+            if newcost < best.cost {
+                best = DPEntry { cost: newcost, cmd, prev: best_ind.ind };
+            }
+        }
+        let update = |kind: MyPacketKind, max_len: usize, best: &mut DPEntry| {
+            if max_len == 0 { return; }
+            // first check short commands
+            let upper = (i+max_len).min(data.len());
+            let best_ind = segtrees.constant.query_noiden(i+1, upper+1);
+            let best_cmd = MyPacket { len: best_ind.ind as usize - i, kind };
+            if (best_cmd.size() + best_ind.cost as usize) < best.cost as usize {
+                *best = DPEntry { cost: best_cmd.size() as u32 + best_ind.cost, cmd: best_cmd, prev: best_ind.ind };
+            }
+        };
+        if i+2 < data.len() {
+            if data[i] == data[i+2] {
+                wordfill_len = (wordfill_len + 1).min(63);
+            } else {
+                wordfill_len = 2;
+            }
+            update(MyPacketKind::Wordfill(data[i], data[i+1]), wordfill_len, &mut best);
+        }
+        // long backref
+        if let Some((pk, max_len)) = find_backref::<ALG_LZ2>(data.len(), &fuckedupdata, &suff, &inv_suff, &lcp, i, false) {
+            let max = (max_len as usize).min(64);
+            if let PacketKind::Backref(BackrefKind::Abs(x)) = pk {
+                update(MyPacketKind::Backref { offset: x as usize }, max, &mut best);
+            } else {
+                panic!();
+            }
+        }
+        if matches!(best.cmd.kind, MyPacketKind::Eof) {
+            panic!();
+        }
+        best_for_suffix[i] = best;
+        segtrees.update(i, best.cost);
+    }
+    //dbg!(best_for_suffix[offset].cost);
+    let mut pkts = vec![];
+    let mut i = 0;
+    loop {
+        let pk = best_for_suffix[i].cmd;
+        pkts.push(pk);
+        if i == data.len() { break; }
+        i = best_for_suffix[i].prev as usize;
+    }
+    //println!("{:?}", &pkts);
+    let mut outbuf = vec![];
+    let mut out_literals = vec![];
+    for x in pkts.iter() {
+        //dbg!(x);
+        x.encode(data, &mut outbuf, &mut out_literals);
+    }
+    buf.extend_from_slice(&(outbuf.len() as u16 + 2).to_le_bytes());
+    buf.extend_from_slice(&outbuf);
+    buf.extend_from_slice(&out_literals);
+    //dbg!(buf);
+    //dbg!(buf.len());
+}
+fn decomp_mything(buf: &[u8], out: &mut Vec<u8>) {
+    let literals_start = u16::from_le_bytes(buf[0..2].try_into().unwrap()) as usize;
+    let mut literal_off = literals_start;
+    let mut i = 2;
+    while i < literals_start {
+        let x = buf[i];
+        i += 1;
+        if x < 128 {
+            // literal
+            out.extend_from_slice(&buf[literal_off..literal_off + x as usize]);
+            literal_off += x as usize;
+        } else if x & 0x40 == 0 {
+            if x & 0x3f == 0 { break; }
+            // wordfill
+            let b1 = buf[i];
+            let b2 = buf[i+1];
+            i += 2;
+            out.extend((0..).flat_map(|_| [b1, b2]).take((x & 0x3f) as usize))
+        } else {
+            // backref
+            let off = u16::from_le_bytes(buf[i..i+2].try_into().unwrap()) as usize;
+            i += 2;
+            for j in 0..=(x & 0x3f) as usize {
+                out.push(out[off + j]);
+            }
+        }
+    }
+    //dbg!(out);
+}
+
 /// Compress the given `data` with `alg`, writing the output into `buf`.
 ///
 /// Specifying non-zero `offset` will only start compressing from index `offset`
@@ -647,6 +822,7 @@ pub fn compress_into(alg: Algorithm, data: &[u8], offset: usize, buf: &mut Vec<u
     match alg {
         LZ2 => compress_internal::<ALG_LZ2>(data, offset, buf),
         LZ3 => compress_internal::<ALG_LZ3>(data, offset, buf),
+        MyThing => compress_mything(data, buf),
     }
 }
 
@@ -668,6 +844,7 @@ pub fn decompress_into(alg: Algorithm, data: &[u8], buf: &mut Vec<u8>) {
     match alg {
         LZ2 => decompress_internal::<ALG_LZ2>(data, buf),
         LZ3 => decompress_internal::<ALG_LZ3>(data, buf),
+        MyThing => decomp_mything(data, buf),
     }
 }
 
