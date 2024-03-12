@@ -6,7 +6,7 @@
 //! compressors, but should still be fast enough for most uses. The absolute
 //! worst-case 32KB input the author is aware of takes 700ms to compress, but
 //! most real-world inputs should take under 100ms. (This worst case only occurs
-//! with LZ3: with HAL or LZ2, the same input takes 270ms).
+//! with LZ3: with LZ2, the same input takes 270ms).
 //!
 //! See the [`Algorithm`] enum for implemented algorithms. For basic usage, you
 //! can just pass an Algorithm variant along with your data to [`compress`] or
