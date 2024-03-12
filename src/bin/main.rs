@@ -4,7 +4,7 @@ use clap::{arg, value_parser, Command};
 use snes_squish::{compress, decompress, Algorithm};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let matches = Command::new("thingy")
+    let matches = Command::new("snes-squish")
         .arg(
             arg!(-a --algorithm <ALG> "Compression algorithm to use")
                 .default_value("lz3")
